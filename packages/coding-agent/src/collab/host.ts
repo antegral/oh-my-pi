@@ -234,7 +234,7 @@ export class CollabHost {
 				firstOpen.resolve();
 			}
 		};
-		socket.onFrame = (frame, fromPeer) => this.#handleFrame(frame, fromPeer);
+		socket.onFrame = (frame, fromPeer, legId) => this.#handleFrame(frame, fromPeer, legId);
 		socket.onControl = msg => {
 			if (msg.t === "peer-left") this.#handlePeerLeft(msg.peer);
 		};
@@ -245,12 +245,26 @@ export class CollabHost {
 				return;
 			}
 			if (willReconnect) {
+				// The relay frees the room as soon as it observes our close, so every guest
+				// was dropped with 4001 and has to rejoin under a fresh peer id. No peer-left
+				// arrives for the old ids, so drop them now — before a rejoining guest can
+				// register — or they linger in the participant list and keep
+				// #hasWritablePeers() routing UI requests to peers that cannot answer.
+				// Pending UI requests stay: #handleHello replays them to the rejoining guest.
+				this.#peers.clear();
+				this.#updateStatusSegment();
 				this.#ctx.showStatus(`Collab relay connection lost (${reason}), reconnecting…`, { dim: true });
 			} else {
 				void this.#teardown();
 				this.#ctx.session.emitNotice("warning", `Collab ended: ${reason}`, "collab");
 			}
 		};
+		socket.onReconnect = () =>
+			this.#ctx.session.emitNotice(
+				"info",
+				"Collab relay reconnected — guests must rejoin with the same link",
+				"collab",
+			);
 		socket.connect();
 
 		const timeout = setTimeout(
@@ -337,25 +351,25 @@ export class CollabHost {
 		this.#socket.send(frame);
 	}
 
-	#handleFrame(frame: CollabFrame, fromPeer: number): void {
+	#handleFrame(frame: CollabFrame, fromPeer: number, legId: number): void {
 		switch (frame.t) {
 			case "hello":
 				this.#handleHello(frame.name, frame.proto, frame.writeToken, fromPeer);
 				break;
 			case "prompt":
-				this.#handlePrompt(frame.text, frame.images, fromPeer);
+				this.#handlePrompt(frame.text, frame.images, fromPeer, legId);
 				break;
 			case "abort":
 				this.#handleAbort(fromPeer);
 				break;
 			case "agent-cmd":
-				this.#handleAgentCmd(frame.cmd, frame.agentId, frame.text, fromPeer);
+				this.#handleAgentCmd(frame.cmd, frame.agentId, frame.text, fromPeer, legId);
 				break;
 			case "ui-response":
 				this.#handleUiResponse(frame.reqId, frame.value, fromPeer);
 				break;
 			case "fetch-transcript":
-				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer);
+				void this.#handleFetchTranscript(frame.reqId, frame.agentId, frame.fromByte, fromPeer, legId);
 				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
@@ -473,7 +487,7 @@ export class CollabHost {
 		this.#pendingUi.get(reqId)?.settle({ kind: "answered", value });
 	}
 
-	#handlePrompt(text: string, images: ImageContent[] | undefined, fromPeer: number): void {
+	#handlePrompt(text: string, images: ImageContent[] | undefined, fromPeer: number, legId: number): void {
 		const peer = this.#peers.get(fromPeer);
 		if (!peer?.canWrite) {
 			this.#rejectReadOnly("prompting", fromPeer);
@@ -500,8 +514,10 @@ export class CollabHost {
 				{ streamingBehavior: "steer", queueChipText: text },
 			)
 			.catch(err => {
+				// Tagged with the arrival leg: a steered prompt settles when the turn that
+				// absorbed it does, long after a reconnect may have re-minted this peer id.
 				logger.warn("collab guest prompt failed", { error: String(err) });
-				this.#socket?.send({ t: "error", message: `prompt failed: ${String(err)}` }, fromPeer);
+				this.#socket?.send({ t: "error", message: `prompt failed: ${String(err)}` }, fromPeer, legId);
 			});
 	}
 
@@ -590,7 +606,13 @@ export class CollabHost {
 		}, AGENTS_DEBOUNCE_MS);
 	}
 
-	#handleAgentCmd(cmd: "chat" | "kill" | "revive", agentId: string, text: string | undefined, fromPeer: number): void {
+	#handleAgentCmd(
+		cmd: "chat" | "kill" | "revive",
+		agentId: string,
+		text: string | undefined,
+		fromPeer: number,
+		legId: number,
+	): void {
 		if (!this.#peers.get(fromPeer)?.canWrite) {
 			this.#rejectReadOnly("agent control", fromPeer);
 			return;
@@ -601,9 +623,12 @@ export class CollabHost {
 			this.#socket?.send({ t: "error", message: `agent ${agentId}: advisor transcripts are read-only` }, fromPeer);
 			return;
 		}
+		// Tagged with the arrival leg: these settle when an agent lifecycle does, which can
+		// outlast a reconnect, and the relay hands peer ids out from 1 again once it frees
+		// the room — an untagged reply would name whoever inherited this one.
 		const fail = (err: unknown) => {
 			logger.warn("collab agent-cmd failed", { cmd, agentId, error: String(err) });
-			this.#socket?.send({ t: "error", message: `agent ${agentId}: ${String(err)}` }, fromPeer);
+			this.#socket?.send({ t: "error", message: `agent ${agentId}: ${String(err)}` }, fromPeer, legId);
 		};
 		switch (cmd) {
 			case "chat": {
@@ -638,9 +663,18 @@ export class CollabHost {
 	}
 
 	/** Incremental transcript read mirroring the hub's readFileIncremental contract. */
-	async #handleFetchTranscript(reqId: number, agentId: string, fromByte: number, fromPeer: number): Promise<void> {
+	async #handleFetchTranscript(
+		reqId: number,
+		agentId: string,
+		fromByte: number,
+		fromPeer: number,
+		legId: number,
+	): Promise<void> {
+		// Answered on the leg that asked: the reads below can straddle a reconnect, and the
+		// relay hands peer ids out from 1 again once it frees the room, so a reply that
+		// named only the id could reach whoever inherited it.
 		const reply = (text: string, newSize: number, error?: string) =>
-			this.#socket?.send({ t: "transcript", reqId, text, newSize, error }, fromPeer);
+			this.#socket?.send({ t: "transcript", reqId, text, newSize, error }, fromPeer, legId);
 		const file = AgentRegistry.global().get(agentId)?.sessionFile;
 		if (!file) {
 			reply("", fromByte, "no transcript available");

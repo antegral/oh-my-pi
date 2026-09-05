@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a shared collab session being destroyed with "a host is already connected for this room" after the host's relay connection dropped: the host now treats that conflict as its own stale registration for up to two minutes and keeps retrying, so the room and its invite link survive and guests can reconnect with the same link; the reconnect notice waits until the new connection has stayed up long enough for a rejection to have arrived.
+
 ## [18.1.12] - 2026-09-06
 
 - Fixed edit and write results to report the formatted bytes actually committed by LSP writethrough.
